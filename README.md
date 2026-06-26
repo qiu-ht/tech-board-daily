@@ -22,11 +22,17 @@ https://push2.eastmoney.com/api/qt/clist/get
 
 ## 本地运行
 
+**方式一：联网安装（推荐）**
 ```bash
-# 安装依赖（推荐 curl_cffi，模拟浏览器TLS指纹更稳定）
 pip install -r requirements.txt
+python tech_board_daily.py
+```
 
-# 运行脚本
+**方式二：离线安装（无需联网）**
+
+`vendor/` 目录已包含所有依赖的 wheel 包，直接离线安装：
+```bash
+pip install --no-index --find-links=vendor -r requirements.txt
 python tech_board_daily.py
 ```
 
