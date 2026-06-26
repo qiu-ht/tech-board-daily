@@ -5,6 +5,10 @@
 - 覆盖: 概念板块 + 行业板块 中所有科技相关板块
 - 输出: 控制台表格 + HTML报告 + JSON数据文件
 
+502问题说明:
+  push2.eastmoney.com 是东方财富的高频行情推送节点，非交易时段偶尔502是正常现象。
+  脚本已内置多重保障：Session复用、递增重试、Header轮换、缓存兜底。
+
 本地运行:
   pip install -r requirements.txt
   python tech_board_daily.py
@@ -18,9 +22,9 @@ import time
 import datetime
 import os
 import sys
+import random
 
-# 使用标准 requests（Windows/Linux通用，无TLS指纹问题）
-# curl_cffi 可选安装，仅在Linux下用于模拟浏览器指纹
+# ── HTTP库检测 ──
 try:
     import requests
     HAS_REQUESTS = True
@@ -39,11 +43,9 @@ if not HAS_REQUESTS and not HAS_CURL_CFFI:
     print("  pip install curl_cffi")
     sys.exit(1)
 
-# ============================================================
-# 配置区域
-# ============================================================
+# ── 配置 ──────────────────────────────────────────────────────
 
-# 科技相关关键词（会自动从全部板块中匹配名称包含这些词的板块）
+# 科技相关关键词
 TECH_KEYWORDS = [
     "CPO", "半导体", "芯片", "AI", "人工智能", "光模块", "算力", "GPU",
     "存储", "数据中心", "机器人", "5G", "通信", "华为", "苹果", "消费电子",
@@ -58,117 +60,161 @@ TECH_KEYWORDS = [
     "模拟芯片", "数字芯片",
 ]
 
-# API地址
 API_URL = "https://push2.eastmoney.com/api/qt/clist/get"
-
-# 输出目录（默认在脚本所在目录下的 output 子目录）
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(SCRIPT_DIR, "output"))
-
-# ============================================================
-# 数据获取
-# ============================================================
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Referer": "https://quote.eastmoney.com/",
-    "Accept": "application/json, text/plain, */*",
-}
-
-# 字段说明:
-# f2  = 最新价(板块指数)
-# f3  = 涨跌幅(%)
-# f4  = 涨跌额
-# f12 = 板块代码
-# f14 = 板块名称
-# f104 = 上涨家数
-# f105 = 下跌家数
-# f62 = 主力净流入(万元)
 FIELDS = "f12,f14,f2,f3,f4,f104,f105,f62"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(SCRIPT_DIR, "output"))
+CACHE_FILE = os.path.join(OUTPUT_DIR, ".last_cache.json")
 
-def _http_get(url, params, headers, timeout=15, max_retries=3):
-    """统一HTTP GET请求，自动选择最佳可用库，含502/503重试"""
+# 多组User-Agent和Referer轮换，降低被限概率
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+REFERERS = [
+    "https://quote.eastmoney.com/center/boardlist.html",
+    "https://data.eastmoney.com/bkzj/hy.html",
+    "https://quote.eastmoney.com/",
+]
+
+# ── HTTP请求层 ──────────────────────────────────────────────────
+
+
+def _create_session():
+    """创建带连接池的Session"""
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=5,
+        pool_maxsize=10,
+        max_retries=requests.adapters.Retry(total=2, backoff_factor=0.5),
+    )
+    s.mount("https://", adapter)
+    return s
+
+
+SESSION = _create_session() if HAS_REQUESTS else None
+
+
+def _random_headers():
+    """随机选一组headers，降低被识别概率"""
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": random.choice(REFERERS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
+
+
+def _http_get(url, params, timeout=15, max_retries=4):
+    """HTTP GET，502自动重试，重试时换Headers"""
+    last_error = None
     for attempt in range(max_retries):
-        # 优先用 curl_cffi（Linux环境下更稳定），回退到标准 requests
+        headers = _random_headers()
+
+        # 优先curl_cffi（Linux下TLS指纹更自然）
         if HAS_CURL_CFFI:
             try:
                 resp = cffi_requests.get(
                     url, params=params, headers=headers,
                     impersonate="chrome", timeout=timeout
                 )
-                if resp.status_code in (502, 503):
+                if resp.status_code in (502, 503, 504):
                     if attempt < max_retries - 1:
-                        time.sleep(3 + attempt * 2)  # 递增等待
+                        wait = 2 ** attempt + random.uniform(1, 3)
+                        time.sleep(wait)
                         continue
+                if resp.status_code != 200 and attempt < max_retries - 1:
+                    time.sleep(2 ** attempt + random.uniform(0, 2))
+                    continue
                 return resp
-            except Exception:
-                pass  # curl_cffi失败则回退到requests
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt + random.uniform(1, 2))
 
+        # 标准requests
         if HAS_REQUESTS:
             try:
-                resp = requests.get(
+                resp = SESSION.get(
                     url, params=params, headers=headers,
                     timeout=timeout
                 )
-                if resp.status_code in (502, 503):
+                if resp.status_code in (502, 503, 504):
                     if attempt < max_retries - 1:
-                        time.sleep(3 + attempt * 2)  # 递增等待
+                        wait = 2 ** attempt + random.uniform(1, 3)
+                        print(f"  [RETRY] HTTP {resp.status_code}，{wait:.1f}秒后重试...")
+                        time.sleep(wait)
                         continue
-                return resp
-            except requests.exceptions.ConnectionError:
-                if attempt < max_retries - 1:
-                    time.sleep(3 + attempt * 2)
+                if resp.status_code != 200:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt + random.uniform(0, 2))
                     continue
-                raise
+                return resp
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt + random.uniform(1, 2)
+                    print(f"  [RETRY] {type(e).__name__}，{wait:.1f}秒后重试...")
+                    time.sleep(wait)
 
-    raise RuntimeError("所有重试均失败")
+    raise last_error or RuntimeError(f"HTTP请求失败（重试{max_retries}次）")
+
+
+# ── 数据获取层 ──────────────────────────────────────────────────
+
+
+def fetch_board_page(fs_code: str, page: int) -> tuple:
+    """获取单页板块数据，返回 (boards, total)"""
+    params = {
+        "pn": str(page),
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": fs_code,
+        "fields": FIELDS,
+        "_": str(int(time.time() * 1000)),
+    }
+    resp = _http_get(API_URL, params=params, timeout=15)
+    data = resp.json()
+    if not data.get("data") or not data["data"].get("diff"):
+        return [], 0
+    return data["data"]["diff"], data["data"]["total"]
 
 
 def fetch_board_list(fs_code: str, max_pages: int = 10) -> list:
-    """分页获取板块列表，包含502自动重试"""
+    """分页获取板块列表"""
     all_boards = []
-    for pn in range(1, max_pages + 1):
-        params = {
-            "pn": str(pn),
-            "pz": "100",
-            "po": "1",
-            "np": "1",
-            "fltt": "2",
-            "invt": "2",
-            "fid": "f3",
-            "fs": fs_code,
-            "fields": FIELDS,
-            "_": str(int(time.time() * 1000)),
-        }
-        for attempt in range(5):  # 每页最多重试5次（应对502）
-            try:
-                resp = _http_get(API_URL, params=params, headers=HEADERS, timeout=15)
-                # 检查HTTP状态码
-                if resp.status_code in (502, 503):
-                    print(f"[WARN] 第{pn}页返回{resp.status_code}，等待重试...")
-                    time.sleep(3 + attempt * 3)  # 递增等待3/6/9/12/15秒
-                    continue
-                if resp.status_code != 200:
-                    print(f"[WARN] 第{pn}页返回HTTP {resp.status_code}")
-                    break
+    total = None
 
-                data = resp.json()
-                if not data.get("data") or not data["data"].get("diff"):
-                    return all_boards
-                boards = data["data"]["diff"]
-                total = data["data"]["total"]
-                all_boards.extend(boards)
-                if pn * 100 >= total:
-                    return all_boards
-                break  # 成功则跳出重试
-            except Exception as e:
-                if attempt < 4:
-                    print(f"[WARN] 第{pn}页请求异常({type(e).__name__}): {str(e)[:60]}")
-                    time.sleep(3 + attempt * 2)
-                else:
-                    print(f"[WARN] 第{pn}页5次重试均失败，跳过")
-        time.sleep(1.5)  # 页间间隔稍长，避免触发限流
+    # 先获取第一页拿total
+    try:
+        boards, total = fetch_board_page(fs_code, 1)
+        all_boards.extend(boards)
+        if total is None or total <= 100:
+            return all_boards
+    except Exception as e:
+        print(f"[WARN] 第1页失败: {e}")
+
+    if not all_boards:
+        return all_boards
+
+    # 获取剩余页
+    total_pages = min(max_pages, (total // 100) + 1)
+    for pn in range(2, total_pages + 1):
+        try:
+            boards, _ = fetch_board_page(fs_code, pn)
+            all_boards.extend(boards)
+        except Exception as e:
+            print(f"[WARN] 第{pn}页失败: {e}")
+        time.sleep(0.8 + random.uniform(0, 0.5))  # 随机间隔
     return all_boards
 
 
@@ -193,38 +239,88 @@ def filter_tech_boards(boards: list) -> list:
     return found
 
 
-# ============================================================
-# 输出格式化
-# ============================================================
+# ── 缓存机制（API全挂时用上次数据兜底）──────────────────────────
 
-def format_console(tech_boards: list, date_str: str) -> str:
-    """格式化控制台输出"""
+
+def load_cache():
+    """加载上次缓存的板块数据"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+                return cache.get("boards", [])
+        except Exception:
+            pass
+    return []
+
+
+def save_cache(tech_boards: list):
+    """保存板块数据到缓存"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "boards": tech_boards,
+        }, f, ensure_ascii=False)
+    os.chmod(CACHE_FILE, 0o600)  # 只让当前用户可读写
+
+
+# ── 交易时段判断 ──────────────────────────────────────────────────
+
+
+def is_trading_time(now=None):
+    """判断当前是否为A股交易时段"""
+    if now is None:
+        now = datetime.datetime.now()
+    # 周末不交易
+    if now.weekday() >= 5:
+        return False, "周末休市"
+    t = now.time()
+    morning_start = datetime.time(9, 15)
+    morning_end = datetime.time(11, 30)
+    afternoon_start = datetime.time(13, 0)
+    afternoon_end = datetime.time(15, 0)
+    if morning_start <= t <= morning_end:
+        return True, "早盘交易中"
+    if afternoon_start <= t <= afternoon_end:
+        return True, "午盘交易中"
+    if t < morning_start:
+        return False, "尚未开盘（9:15开盘）"
+    if morning_end < t < afternoon_start:
+        return False, "午间休市"
+    return False, "已收盘"
+
+
+# ── 输出格式化 ──────────────────────────────────────────────────
+
+
+def format_console(tech_boards: list, date_str: str, source_label: str) -> str:
     lines = []
-    lines.append(f"\n{'='*60}")
+    lines.append(f"\n{'='*62}")
     lines.append(f"  📊 科技板块涨跌日报 - {date_str}")
-    lines.append(f"{'='*60}")
-    lines.append(f"  数据来源: 东方财富网 push2.eastmoney.com API")
+    lines.append(f"{'='*62}")
+    lines.append(f"  数据源: {source_label}")
     lines.append(f"  共监控 {len(tech_boards)} 个科技相关板块")
-    lines.append(f"{'='*60}\n")
+    lines.append(f"{'='*62}\n")
 
     up_boards = [b for b in tech_boards if isinstance(b["change_pct"], (int, float)) and b["change_pct"] > 0]
     up_boards.sort(key=lambda x: x["change_pct"], reverse=True)
     if up_boards:
         lines.append("🟢 涨幅榜 TOP10:")
         for i, b in enumerate(up_boards[:10], 1):
-            lines.append(f"  {i:>2}. {b['name']:<16} 涨跌幅:{b['change_pct']:>+.2f}%  指数:{b['price']}  上涨:{b['up_count']} 下跌:{b['down_count']}")
+            lines.append(f"  {i:>2}. {b['name']:<16} {b['change_pct']:>+.2f}%  指数:{b['price']}")
 
     down_boards = [b for b in tech_boards if isinstance(b["change_pct"], (int, float)) and b["change_pct"] < 0]
     down_boards.sort(key=lambda x: x["change_pct"])
     if down_boards:
         lines.append("\n🔴 跌幅榜 TOP10:")
         for i, b in enumerate(down_boards[:10], 1):
-            lines.append(f"  {i:>2}. {b['name']:<16} 涨跌幅:{b['change_pct']:>+.2f}%  指数:{b['price']}  上涨:{b['up_count']} 下跌:{b['down_count']}")
+            lines.append(f"  {i:>2}. {b['name']:<16} {b['change_pct']:>+.2f}%  指数:{b['price']}")
 
     all_sorted = sorted(tech_boards, key=lambda x: x["change_pct"] if isinstance(x["change_pct"], (int, float)) else 0, reverse=True)
-    lines.append(f"\n📋 全部科技板块一览 (共{len(all_sorted)}个):")
-    lines.append(f"  {'板块名称':<16} {'涨跌幅':>8} {'指数':>10} {'上涨':>4} {'下跌':>4} {'主力净流入(万)':>14}")
-    lines.append(f"  {'-'*60}")
+    lines.append(f"\n📋 全部科技板块 ({len(all_sorted)}个):")
+    lines.append(f"  {'板块':<16} {'涨跌幅':>8} {'指数':>10} {'涨':>4} {'跌':>4} {'主力净流入(万)':>14}")
+    lines.append(f"  {'-'*62}")
     for b in all_sorted:
         pct = b["change_pct"]
         pct_str = f"{pct:>+.2f}%" if isinstance(pct, (int, float)) else str(pct)
@@ -232,14 +328,14 @@ def format_console(tech_boards: list, date_str: str) -> str:
         inflow_str = f"{inflow:>+.0f}" if isinstance(inflow, (int, float)) else str(inflow)
         lines.append(f"  {b['name']:<16} {pct_str:>8} {str(b['price']):>10} {str(b['up_count']):>4} {str(b['down_count']):>4} {inflow_str:>14}")
 
-    lines.append(f"\n{'='*60}")
+    lines.append(f"\n{'='*62}")
     return "\n".join(lines)
 
 
-def format_html(tech_boards: list, date_str: str) -> str:
-    """生成HTML报告"""
-    all_sorted = sorted(tech_boards, key=lambda x: x["change_pct"] if isinstance(x["change_pct"], (int, float)) else 0, reverse=True)
-
+def format_html(tech_boards: list, date_str: str, source_label: str) -> str:
+    all_sorted = sorted(tech_boards,
+        key=lambda x: x["change_pct"] if isinstance(x["change_pct"], (int, float)) else 0,
+        reverse=True)
     up_count = len([b for b in tech_boards if isinstance(b["change_pct"], (int, float)) and b["change_pct"] > 0])
     down_count = len([b for b in tech_boards if isinstance(b["change_pct"], (int, float)) and b["change_pct"] < 0])
     flat_count = len(tech_boards) - up_count - down_count
@@ -253,7 +349,6 @@ def format_html(tech_boards: list, date_str: str) -> str:
         inflow = b["main_net_inflow"]
         inflow_str = f"{inflow:>+.0f}" if isinstance(inflow, (int, float)) else str(inflow)
         inflow_color = "#e74c3c" if isinstance(inflow, (int, float)) and inflow < 0 else ("#27ae60" if isinstance(inflow, (int, float)) and inflow > 0 else "#999")
-
         rows_html += f"""
         <tr>
             <td>{b['name']}</td>
@@ -265,7 +360,7 @@ def format_html(tech_boards: list, date_str: str) -> str:
             <td style="color:{inflow_color}">{inflow_str}</td>
         </tr>"""
 
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -273,6 +368,7 @@ def format_html(tech_boards: list, date_str: str) -> str:
 <style>
     body {{ font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }}
     h1 {{ text-align: center; color: #e0e0e0; }}
+    .meta {{ text-align: center; color: #aaa; margin: 10px 0; }}
     .stats {{ text-align: center; margin: 20px 0; }}
     .stat-card {{ display: inline-block; padding: 10px 20px; margin: 5px; border-radius: 8px; }}
     .stat-up {{ background: #27ae60; }}
@@ -287,109 +383,117 @@ def format_html(tech_boards: list, date_str: str) -> str:
 </head>
 <body>
 <h1>📊 科技板块涨跌日报</h1>
-<p style="text-align:center;color:#aaa;">{date_str} | 数据来源: 东方财富网 API</p>
-
+<p class="meta">{date_str} | {source_label}</p>
 <div class="stats">
-    <span class="stat-card stat-up">🟢 上涨 {up_count} 个板块</span>
-    <span class="stat-card stat-down">🔴 下跌 {down_count} 个板块</span>
-    <span class="stat-card stat-flat">⚪ 平盘 {flat_count} 个板块</span>
+    <span class="stat-card stat-up">🟢 上涨 {up_count} 个</span>
+    <span class="stat-card stat-down">🔴 下跌 {down_count} 个</span>
+    <span class="stat-card stat-flat">⚪ 平盘 {flat_count} 个</span>
 </div>
-
 <table>
-<thead>
-<tr>
-    <th>板块名称</th>
-    <th>涨跌幅</th>
-    <th>指数点位</th>
-    <th>涨跌额</th>
-    <th>上涨家数</th>
-    <th>下跌家数</th>
-    <th>主力净流入(万)</th>
-</tr>
-</thead>
-<tbody>
-{rows_html}
-</tbody>
+<thead><tr>
+    <th>板块名称</th><th>涨跌幅</th><th>指数点位</th><th>涨跌额</th><th>上涨家数</th><th>下跌家数</th><th>主力净流入(万)</th>
+</tr></thead>
+<tbody>{rows_html}</tbody>
 </table>
-
 <div class="footer">
-    <p>API: 东方财富 push2.eastmoney.com | fs=m:90+t:3(概念板块) / fs=m:90+t:2(行业板块)</p>
-    <p>字段: f2=最新价 f3=涨跌幅 f4=涨跌额 f12=板块代码 f14=板块名称 f104=上涨家数 f105=下跌家数 f62=主力净流入</p>
+    <p>数据源: 东方财富 push2.eastmoney.com | 完全免费 无需注册</p>
 </div>
 </body>
 </html>"""
-    return html
 
 
-# ============================================================
-# 主流程
-# ============================================================
+# ── 主流程 ──────────────────────────────────────────────────────
+
 
 def main():
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d %H:%M:%S")
     date_file = now.strftime("%Y%m%d")
 
-    # 显示当前使用的HTTP库
+    # 交易时段提示
+    trading, trading_msg = is_trading_time(now)
+    print(f"[INFO] 当前时间: {date_str} | {trading_msg}")
+
+    # HTTP库信息
+    lib_info = []
     if HAS_CURL_CFFI:
-        print("[INFO] HTTP库: curl_cffi (模拟浏览器TLS指纹)")
-    elif HAS_REQUESTS:
-        print("[INFO] HTTP库: requests (标准库)")
+        lib_info.append("curl_cffi")
+    if HAS_REQUESTS:
+        lib_info.append("requests")
+    print(f"[INFO] HTTP引擎: {', '.join(lib_info)} | 重试策略: 指数退避+随机抖动")
 
-    print(f"[INFO] 开始获取科技板块数据 - {date_str}")
+    # 获取数据（最多尝试3轮）
+    tech_boards = []
+    source_label = "东方财富 push2.eastmoney.com"
+    for round_num in range(1, 4):
+        try:
+            print(f"\n[INFO] --- 第{round_num}轮尝试获取数据 ---")
+            concept_boards = fetch_board_list("m:90+t:3", max_pages=10)
+            print(f"[INFO] 概念板块: {len(concept_boards)}个")
+            industry_boards = fetch_board_list("m:90+t:2", max_pages=3)
+            print(f"[INFO] 行业板块: {len(industry_boards)}个")
+            all_boards = concept_boards + industry_boards
+            tech_boards = filter_tech_boards(all_boards)
 
-    # 1. 获取概念板块 (fs=m:90+t:3)
-    print("[INFO] 正在获取概念板块...")
-    concept_boards = fetch_board_list("m:90+t:3", max_pages=10)
-    print(f"[INFO] 获取到 {len(concept_boards)} 个概念板块")
+            if tech_boards:
+                print(f"[INFO] ✅ 匹配到 {len(tech_boards)} 个科技相关板块")
+                break
+            else:
+                print(f"[WARN] 未匹配到板块，可能API返回空数据")
 
-    # 2. 获取行业板块 (fs=m:90+t:2)
-    print("[INFO] 正在获取行业板块...")
-    industry_boards = fetch_board_list("m:90+t:2", max_pages=3)
-    print(f"[INFO] 获取到 {len(industry_boards)} 个行业板块")
+        except Exception as e:
+            print(f"[WARN] 第{round_num}轮失败: {e}")
+            if round_num < 3:
+                wait = 10 * round_num
+                print(f"[INFO] 等待{wait}秒后重试...")
+                time.sleep(wait)
 
-    # 3. 合并并筛选科技相关板块
-    all_boards = concept_boards + industry_boards
-    tech_boards = filter_tech_boards(all_boards)
-    print(f"[INFO] 匹配到 {len(tech_boards)} 个科技相关板块")
+        if round_num == 3 and not tech_boards:
+            print("\n[INFO] API三轮都失败，尝试从缓存加载上次数据...")
+            tech_boards = load_cache()
+            if tech_boards:
+                source_label = "本地缓存 (API不可用时的兜底数据)"
+                print(f"[WARN] 使用缓存数据（{len(tech_boards)}个板块），非实时数据！")
 
     if not tech_boards:
-        print("[ERROR] 未获取到任何科技板块数据，可能API不可用")
+        print("[ERROR] 无法获取任何板块数据，请检查网络连接")
+        if not trading:
+            print("[提示] 当前非交易时段，服务器可能处于维护状态，交易时段重试即可")
         sys.exit(1)
 
-    # 4. 创建输出目录
+    # 保存缓存
+    save_cache(tech_boards)
+
+    # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 5. 控制台输出
-    console_output = format_console(tech_boards, date_str)
+    # 控制台输出
+    console_output = format_console(tech_boards, date_str, source_label)
     print(console_output)
 
-    # 6. 保存JSON数据
+    # JSON
     json_file = os.path.join(OUTPUT_DIR, f"tech_board_{date_file}.json")
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump({
             "date": date_str,
-            "api_source": "东方财富 push2.eastmoney.com",
-            "api_url": API_URL,
-            "concept_board_count": len(concept_boards),
-            "industry_board_count": len(industry_boards),
+            "source": source_label,
+            "trading_status": trading_msg,
             "tech_board_count": len(tech_boards),
             "boards": tech_boards,
         }, f, ensure_ascii=False, indent=2)
-    print(f"[INFO] JSON数据已保存: {json_file}")
+    print(f"[INFO] JSON: {json_file}")
 
-    # 7. 保存HTML报告
+    # HTML
     html_file = os.path.join(OUTPUT_DIR, f"tech_board_{date_file}.html")
-    html_content = format_html(tech_boards, date_str)
     with open(html_file, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"[INFO] HTML报告已保存: {html_file}")
+        f.write(format_html(tech_boards, date_str, source_label))
+    print(f"[INFO] HTML: {html_file}")
 
-    # 8. 保存控制台文本
+    # TXT
     txt_file = os.path.join(OUTPUT_DIR, f"tech_board_{date_file}.txt")
     with open(txt_file, "w", encoding="utf-8") as f:
         f.write(console_output)
-    print(f"[INFO] 文本报告已保存: {txt_file}")
+    print(f"[INFO] TXT: {txt_file}")
 
     return tech_boards
 

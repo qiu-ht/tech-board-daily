@@ -4,63 +4,59 @@
 
 ## 数据源
 
-使用 **东方财富网公开 API**：
+使用 **东方财富网公开 API**（完全免费，无需注册）：
 
 ```
 https://push2.eastmoney.com/api/qt/clist/get
 ```
 
-| 参数 | 说明 |
-|------|------|
-| `fs=m:90+t:3` | 概念板块列表 |
-| `fs=m:90+t:2` | 行业板块列表 |
-| `f3` | 涨跌幅(%) |
-| `f2` | 板块指数点位 |
-| `f62` | 主力净流入(万元) |
+### 为什么偶尔 502？
 
-无需注册、无需 API Key，直接请求即可获取 JSON 数据。
+`push2` 是东方财富的**高频行情推送节点**，非交易时段（夜间/周末/午休）服务器降级维护时会偶发 502。脚本已内置多重保障：
+
+| 策略 | 说明 |
+|------|------|
+| Session 连接池 | 复用 TCP 连接，减少握手失败 |
+| 指数退避重试 | 502 后 2→4→8→16 秒递增等待，最多重试 4 次 |
+| Header 轮换 | 每次请求随机换 User-Agent 和 Referer |
+| 3 轮整体重试 | 一次运行最多 3 轮整体重试，轮间等 10→20→30 秒 |
+| 缓存兜底 | API 全挂时自动加载上次成功数据，标注「缓存」 |
+| 交易时段识别 | 自动判断当前是否交易时段，给出友好提示 |
 
 ## 本地运行
 
-**方式一：联网安装（推荐）**
+**方式一：联网安装**
 ```bash
 pip install -r requirements.txt
 python tech_board_daily.py
 ```
 
-**方式二：离线安装（无需联网）**
+**方式二：离线安装**
 
-`vendor/` 目录已包含所有依赖的 wheel 包（Windows x64 + Python 3.14），直接离线安装：
+`vendor/` 目录已包含所有依赖的 wheel 包（Windows x64 + Python 3.14）：
 ```bash
 pip install --no-index --find-links=vendor -r requirements.txt
 python tech_board_daily.py
 ```
 
-输出文件默认保存在脚本所在目录的 `output/` 子目录下：
+输出文件保存在脚本所在目录的 `output/` 子目录下：
+- `tech_board_YYYYMMDD.html` — 可视化报告（深色主题）
 - `tech_board_YYYYMMDD.json` — JSON原始数据
-- `tech_board_YYYYMMDD.html` — HTML可视化报告（深色主题）
 - `tech_board_YYYYMMDD.txt`  — 控制台文本报告
 
-## Windows 定时运行（任务计划程序）
+## Windows 定时运行
 
-建议在 A 股收盘后运行（15:05），数据最准确：
+用任务计划程序，A 股收盘后运行（15:05）数据最准：
 
-1. 打开「任务计划程序」(`taskschd.msc`)
-2. 创建基本任务 → 名称：科技板块日报
-3. 触发器：每天 15:05
-4. 操作：启动程序 → `python` → 参数 `tech_board_daily.py` → 起始于脚本目录
-
-或用 PowerShell 一行搞定：
 ```powershell
 schtasks /create /tn "TechBoardDaily" /tr "python C:\path\to\tech_board_daily.py" /sc daily /st 15:05
 ```
 
-## 依赖说明
+## 依赖
 
-- **requests**：标准HTTP库，Windows下默认使用，稳定可靠
-- **curl_cffi**：可选安装，模拟浏览器 TLS 指纹，Linux环境下更稳定
-- 脚本会自动选择：优先 curl_cffi → 回退到 requests
+- `requests` — 标准HTTP库，Windows/Linux通用
+- `curl_cffi` — 可选，Linux下模拟浏览器TLS指纹
 
 ## 自定义监控板块
 
-编辑脚本中的 `TECH_KEYWORDS` 列表即可增减监控的科技板块关键词，脚本会从东方财富全部板块中自动匹配名称包含这些关键词的板块。
+编辑脚本中的 `TECH_KEYWORDS` 列表即可增减关键词，脚本会从东方财富全部板块中自动匹配。
