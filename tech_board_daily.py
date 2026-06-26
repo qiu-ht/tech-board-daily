@@ -87,29 +87,46 @@ HEADERS = {
 FIELDS = "f12,f14,f2,f3,f4,f104,f105,f62"
 
 
-def _http_get(url, params, headers, timeout=15):
-    """统一HTTP GET请求，自动选择最佳可用库"""
-    # 优先用 curl_cffi（Linux环境下更稳定），回退到标准 requests
-    if HAS_CURL_CFFI:
-        try:
-            return cffi_requests.get(
-                url, params=params, headers=headers,
-                impersonate="chrome", timeout=timeout
-            )
-        except Exception:
-            pass  # curl_cffi失败则回退到requests
+def _http_get(url, params, headers, timeout=15, max_retries=3):
+    """统一HTTP GET请求，自动选择最佳可用库，含502/503重试"""
+    for attempt in range(max_retries):
+        # 优先用 curl_cffi（Linux环境下更稳定），回退到标准 requests
+        if HAS_CURL_CFFI:
+            try:
+                resp = cffi_requests.get(
+                    url, params=params, headers=headers,
+                    impersonate="chrome", timeout=timeout
+                )
+                if resp.status_code in (502, 503):
+                    if attempt < max_retries - 1:
+                        time.sleep(3 + attempt * 2)  # 递增等待
+                        continue
+                return resp
+            except Exception:
+                pass  # curl_cffi失败则回退到requests
 
-    if HAS_REQUESTS:
-        return requests.get(
-            url, params=params, headers=headers,
-            timeout=timeout
-        )
+        if HAS_REQUESTS:
+            try:
+                resp = requests.get(
+                    url, params=params, headers=headers,
+                    timeout=timeout
+                )
+                if resp.status_code in (502, 503):
+                    if attempt < max_retries - 1:
+                        time.sleep(3 + attempt * 2)  # 递增等待
+                        continue
+                return resp
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries - 1:
+                    time.sleep(3 + attempt * 2)
+                    continue
+                raise
 
-    raise RuntimeError("无可用的HTTP库")
+    raise RuntimeError("所有重试均失败")
 
 
 def fetch_board_list(fs_code: str, max_pages: int = 10) -> list:
-    """分页获取板块列表"""
+    """分页获取板块列表，包含502自动重试"""
     all_boards = []
     for pn in range(1, max_pages + 1):
         params = {
@@ -124,9 +141,18 @@ def fetch_board_list(fs_code: str, max_pages: int = 10) -> list:
             "fields": FIELDS,
             "_": str(int(time.time() * 1000)),
         }
-        for attempt in range(3):
+        for attempt in range(5):  # 每页最多重试5次（应对502）
             try:
                 resp = _http_get(API_URL, params=params, headers=HEADERS, timeout=15)
+                # 检查HTTP状态码
+                if resp.status_code in (502, 503):
+                    print(f"[WARN] 第{pn}页返回{resp.status_code}，等待重试...")
+                    time.sleep(3 + attempt * 3)  # 递增等待3/6/9/12/15秒
+                    continue
+                if resp.status_code != 200:
+                    print(f"[WARN] 第{pn}页返回HTTP {resp.status_code}")
+                    break
+
                 data = resp.json()
                 if not data.get("data") or not data["data"].get("diff"):
                     return all_boards
@@ -135,13 +161,14 @@ def fetch_board_list(fs_code: str, max_pages: int = 10) -> list:
                 all_boards.extend(boards)
                 if pn * 100 >= total:
                     return all_boards
-                break
+                break  # 成功则跳出重试
             except Exception as e:
-                if attempt < 2:
-                    time.sleep(2)
+                if attempt < 4:
+                    print(f"[WARN] 第{pn}页请求异常({type(e).__name__}): {str(e)[:60]}")
+                    time.sleep(3 + attempt * 2)
                 else:
-                    print(f"[WARN] 第{pn}页3次重试均失败，跳过: {e}")
-        time.sleep(1)
+                    print(f"[WARN] 第{pn}页5次重试均失败，跳过")
+        time.sleep(1.5)  # 页间间隔稍长，避免触发限流
     return all_boards
 
 
