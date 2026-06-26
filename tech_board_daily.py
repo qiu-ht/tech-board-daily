@@ -6,11 +6,11 @@
 - 输出: 控制台表格 + HTML报告 + JSON数据文件
 
 本地运行:
-  pip install curl_cffi   (推荐，模拟浏览器TLS指纹，更稳定)
+  pip install -r requirements.txt
   python tech_board_daily.py
 
-如果不想安装 curl_cffi，脚本会自动回退到标准 requests，
-但东方财富API可能因TLS指纹检测而拒绝连接。
+离线安装:
+  pip install --no-index --find-links=vendor -r requirements.txt
 """
 
 import json
@@ -19,15 +19,25 @@ import datetime
 import os
 import sys
 
-# 优先使用 curl_cffi（模拟浏览器TLS指纹），回退到标准 requests
+# 使用标准 requests（Windows/Linux通用，无TLS指纹问题）
+# curl_cffi 可选安装，仅在Linux下用于模拟浏览器指纹
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
 try:
     from curl_cffi import requests as cffi_requests
-    USE_CURL_CFFI = True
+    HAS_CURL_CFFI = True
 except ImportError:
-    import requests as std_requests
-    USE_CURL_CFFI = False
-    print("[提示] 未安装 curl_cffi，使用标准 requests（可能被API拒绝连接）")
-    print("[提示] 建议安装: pip install curl_cffi")
+    HAS_CURL_CFFI = False
+
+if not HAS_REQUESTS and not HAS_CURL_CFFI:
+    print("[ERROR] 需要安装 requests 或 curl_cffi")
+    print("  pip install requests")
+    print("  pip install curl_cffi")
+    sys.exit(1)
 
 # ============================================================
 # 配置区域
@@ -62,6 +72,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(SCRIPT_DIR, "output"))
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
+    "Accept": "application/json, text/plain, */*",
 }
 
 # 字段说明:
@@ -77,17 +88,24 @@ FIELDS = "f12,f14,f2,f3,f4,f104,f105,f62"
 
 
 def _http_get(url, params, headers, timeout=15):
-    """统一HTTP GET请求，根据可用库自动选择"""
-    if USE_CURL_CFFI:
-        return cffi_requests.get(
-            url, params=params, headers=headers,
-            impersonate="chrome", timeout=timeout
-        )
-    else:
-        return std_requests.get(
+    """统一HTTP GET请求，自动选择最佳可用库"""
+    # 优先用 curl_cffi（Linux环境下更稳定），回退到标准 requests
+    if HAS_CURL_CFFI:
+        try:
+            return cffi_requests.get(
+                url, params=params, headers=headers,
+                impersonate="chrome", timeout=timeout
+            )
+        except Exception:
+            pass  # curl_cffi失败则回退到requests
+
+    if HAS_REQUESTS:
+        return requests.get(
             url, params=params, headers=headers,
             timeout=timeout
         )
+
+    raise RuntimeError("无可用的HTTP库")
 
 
 def fetch_board_list(fs_code: str, max_pages: int = 10) -> list:
@@ -284,6 +302,12 @@ def main():
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d %H:%M:%S")
     date_file = now.strftime("%Y%m%d")
+
+    # 显示当前使用的HTTP库
+    if HAS_CURL_CFFI:
+        print("[INFO] HTTP库: curl_cffi (模拟浏览器TLS指纹)")
+    elif HAS_REQUESTS:
+        print("[INFO] HTTP库: requests (标准库)")
 
     print(f"[INFO] 开始获取科技板块数据 - {date_str}")
 

@@ -30,7 +30,7 @@ python tech_board_daily.py
 
 **方式二：离线安装（无需联网）**
 
-`vendor/` 目录已包含所有依赖的 wheel 包，直接离线安装：
+`vendor/` 目录已包含所有依赖的 wheel 包（Windows x64 + Python 3.14），直接离线安装：
 ```bash
 pip install --no-index --find-links=vendor -r requirements.txt
 python tech_board_daily.py
@@ -41,20 +41,25 @@ python tech_board_daily.py
 - `tech_board_YYYYMMDD.html` — HTML可视化报告（深色主题）
 - `tech_board_YYYYMMDD.txt`  — 控制台文本报告
 
-## 定时运行（crontab）
+## Windows 定时运行（任务计划程序）
 
 建议在 A 股收盘后运行（15:05），数据最准确：
 
-```bash
-crontab -e
-# 添加：
-5 15 * * 1-5  cd /path/to/tech_board_daily && python tech_board_daily.py
+1. 打开「任务计划程序」(`taskschd.msc`)
+2. 创建基本任务 → 名称：科技板块日报
+3. 触发器：每天 15:05
+4. 操作：启动程序 → `python` → 参数 `tech_board_daily.py` → 起始于脚本目录
+
+或用 PowerShell 一行搞定：
+```powershell
+schtasks /create /tn "TechBoardDaily" /tr "python C:\path\to\tech_board_daily.py" /sc daily /st 15:05
 ```
 
 ## 依赖说明
 
-- `curl_cffi`：模拟浏览器 TLS 指纹，东方财富 API 对标准 requests 可能拒绝连接
-- 如果不想安装 `curl_cffi`，脚本会自动回退到标准 `requests`，但成功率较低
+- **requests**：标准HTTP库，Windows下默认使用，稳定可靠
+- **curl_cffi**：可选安装，模拟浏览器 TLS 指纹，Linux环境下更稳定
+- 脚本会自动选择：优先 curl_cffi → 回退到 requests
 
 ## 自定义监控板块
 
