@@ -1,0 +1,5 @@
+output/
+tech_board_*.json
+tech_board_*.html
+tech_board_*.txt
+__pycache__/
